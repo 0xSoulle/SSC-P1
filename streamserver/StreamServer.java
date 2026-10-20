@@ -17,6 +17,9 @@ import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.w3c.dom.Element;
 import java.util.concurrent.Executors;
 
 /**
@@ -32,12 +35,16 @@ public class StreamServer {
 
     static final int BLOCK_SIZE = 1024;
 
-    // Handshake protocol (Phase A: plaintext, no cryptography yet)
     static final int HS_VERSION = 1, HS_RELEASE = 1;
     static final int TYPE_HELLO = 1, TYPE_ACCEPT = 2, TYPE_REQUEST = 3, TYPE_ALERT = 255;
     static final int MAX_PAYLOAD = 64 * 1024;          // reject absurd sizes before allocating
     static final int SRV_BYTES = 32;                   // 256-bit challenge
-    static final String ACCEPTED_SUITE = "AES/GCM/NoPadding"; // Phase B: read from servercrypto.xml
+    static String ALGORITHM;
+    static String MODE;
+    static String IV;
+    static int IV_SIZE;
+    static String PADDING;
+
     static final SecureRandom RANDOM = new SecureRandom();
 
     record Message(int type, byte[] payload) {}
@@ -45,6 +52,10 @@ public class StreamServer {
     public static void main(String[] args) throws Exception {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : 8081;
         Path root = Paths.get(args.length > 1 ? args[1] : "media").toAbsolutePath().normalize();
+        Path configPath = Paths.get("streamserver", "servercrypto.xml");
+        if (!Files.exists(configPath)) configPath = Paths.get("servercrypto.xml");
+        readCryptoSuite(configPath);
+        System.out.println("Crypto suite: " + ALGORITHM + "/" + MODE + "/" + IV + "/" + PADDING);
 
         try (ServerSocket server = new ServerSocket(port)) {
             System.out.println("Origin server on http://localhost:" + port + "/media/<file.mp4>  (dir: " + root + ")");
@@ -54,6 +65,32 @@ public class StreamServer {
                 pool.submit(() -> handle(client, root));
             }
         }
+    }
+
+    static void readCryptoSuite(Path configPath) throws Exception {
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        factory.setExpandEntityReferences(false);
+
+        Element suite = (Element) factory.newDocumentBuilder().parse(configPath.toFile())
+                .getElementsByTagName("SymCipherSuite").item(0);
+        if (suite == null) throw new IOException("Missing SymCipherSuite in " + configPath);
+
+        String algorithm = suite.getElementsByTagName("Algorithm").item(0).getTextContent().trim();
+        String mode = suite.getElementsByTagName("Mode").item(0).getTextContent().trim();
+        String iv = suite.getElementsByTagName("IV").item(0).getTextContent().trim();
+        String iv_size = suite.getElementsByTagName("IVSIZE").item(0).getTextContent().trim();
+        String padding = suite.getElementsByTagName("Padding").item(0).getTextContent().trim();
+        if (algorithm.isEmpty() || mode.isEmpty() || iv.isEmpty() || iv_size.isEmpty() || padding.isEmpty())
+            throw new IOException("Algorithm, Mode, IV and Padding must be set in " + configPath);
+
+        ALGORITHM = algorithm;
+        MODE = mode;
+        IV = iv;
+        IV_SIZE = Integer.parseInt(iv_size);
+        PADDING = padding;
+
     }
 
     static void handle(Socket socket, Path root) {
@@ -71,7 +108,7 @@ public class StreamServer {
                 sendAlert(out, reason);
                 return;
             }
-            log("handshake OK, media=" + media);
+            log("Handshake OK, media=" + media);
 
             String requestLine = HttpUtil.readLine(in);
             if (requestLine == null || !requestLine.startsWith("GET ")) {
@@ -121,16 +158,16 @@ public class StreamServer {
      *   3  proxy  -> server : SEQX+2 || SHA-256(SRV) || MEDIA
      */
     static String handshake(InputStream in, OutputStream out) throws IOException {
-        // Message 1: the proxy's proposal
+        // M1: the proxy's proposal
         Message m1 = readMessage(in);
-        if (m1.type() != TYPE_HELLO) throw new ProtocolException("expected type 1, got type " + m1.type());
+        if (m1.type() != TYPE_HELLO) throw new ProtocolException("Expected Type 1, got Type " + m1.type());
         DataInputStream p1 = payloadReader(m1);
         long seqX = p1.readLong();
         String pcc = p1.readUTF();
         log("<< 1  SEQX=" + seqX + "  PCC=" + pcc);
-        if (!pcc.equals(ACCEPTED_SUITE)) throw new ProtocolException("unsupported suite " + pcc);
 
-        // Message 2: accept + challenge
+        // M2: Check if server has the same crypto suite, accept + challenge
+        if (!pcc.equals(ALGORITHM + "/" + MODE + "/" + PADDING)) sendAlert(out, "Unsupported Suite " + pcc);
         long seqY = seqX + 1;
         byte[] srv = new byte[SRV_BYTES];
         RANDOM.nextBytes(srv);
@@ -138,27 +175,26 @@ public class StreamServer {
         DataOutputStream p2 = new DataOutputStream(b2);
         p2.writeLong(seqY);
         p2.write(srv);
-        p2.writeUTF(ACCEPTED_SUITE);
+        p2.writeUTF(ALGORITHM + "/" + MODE + "/" + PADDING);
         writeMessage(out, TYPE_ACCEPT, b2.toByteArray());
-        log(">> 2  SEQY=" + seqY + "  SRV=" + hex(srv).substring(0, 16) + "...  CCC=" + ACCEPTED_SUITE);
+        log(">> 2  SEQY=" + seqY + "  SRV=" + hex(srv).substring(0, 16) + "...  CCC=" + ALGORITHM + "/" + MODE + "/" + PADDING);
 
-        // Message 3: challenge response + movie
+        // M3: challenge response + media request
         Message m3 = readMessage(in);
-        if (m3.type() != TYPE_REQUEST) throw new ProtocolException("expected type 3, got type " + m3.type());
+        if (m3.type() != TYPE_REQUEST) throw new ProtocolException("Expected Type 3, got Type " + m3.type());
         DataInputStream p3 = payloadReader(m3);
         long seqZ = p3.readLong();
         byte[] r = new byte[32];
         p3.readFully(r);
         String media = p3.readUTF();
         log("<< 3  SEQZ=" + seqZ + "  R=" + hex(r).substring(0, 16) + "...  MEDIA=" + media);
-        if (seqZ != seqY + 1) throw new ProtocolException("wrong sequence number " + seqZ + ", expected " + (seqY + 1));
-        if (!MessageDigest.isEqual(r, sha256(srv))) throw new ProtocolException("wrong challenge response");
+        if (seqZ != seqY + 1) throw new ProtocolException("Wrong Sequence Number " + seqZ + ", expected " + (seqY + 1));
+        if (!MessageDigest.isEqual(r, sha256(srv))) throw new ProtocolException("Wrong Challenge Response");
         return media;
     }
 
-    /** Header (always plaintext): version(2) | release(2) | type(1) | payload size(4), then the payload. */
+    /** Build the whole message first so it leaves in one write (not one TCP segment per field). Plaintext */
     static void writeMessage(OutputStream out, int type, byte[] payload) throws IOException {
-        // Build the whole message first so it leaves in one write (not one TCP segment per field).
         ByteArrayOutputStream msg = new ByteArrayOutputStream(9 + payload.length);
         DataOutputStream d = new DataOutputStream(msg);
         d.writeShort(HS_VERSION);
@@ -257,6 +293,9 @@ public class StreamServer {
             while (remaining > 0) {
                 int n = raf.read(block, 0, (int) Math.min(block.length, remaining));
                 if (n < 0) break;
+                // TODO: cypher the file with cypher suite
+
+
                 out.write(block, 0, n);
                 out.flush();
                 remaining -= n;

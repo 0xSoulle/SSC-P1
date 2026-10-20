@@ -10,10 +10,16 @@ import java.net.ProtocolException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.concurrent.Executors;
+
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.w3c.dom.Element;
+
 import java.lang.Thread;
 
 /**
@@ -35,7 +41,10 @@ public class ProxySocketServer {
     static final int TYPE_HELLO = 1, TYPE_ACCEPT = 2, TYPE_REQUEST = 3, TYPE_ALERT = 255;
     static final int MAX_PAYLOAD = 64 * 1024;          // reject absurd sizes before allocating
     static final int SRV_BYTES = 32;                   // 256-bit challenge
-    static final String PROPOSED_SUITE = "AES/GCM/NoPadding"; // Phase B: read from proxycrypto.xml
+    static String ALGORITHM; 
+    static String MODE;
+    static String IV;
+    static String PADDING;
     static final SecureRandom RANDOM = new SecureRandom();
 
     record Message(int type, byte[] payload) {}
@@ -72,6 +81,28 @@ public class ProxySocketServer {
                 pool.submit(() -> handle(client, originHost, originPort));
             }
         }
+    }
+
+        static void readCryptoSuite(Path configPath) throws Exception {
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        factory.setExpandEntityReferences(false);
+
+        Element suite = (Element) factory.newDocumentBuilder().parse(configPath.toFile())
+                .getElementsByTagName("SymCipherSuite").item(0);
+        if (suite == null) throw new IOException("Missing SymCipherSuite in " + configPath);
+
+        String algorithm = suite.getElementsByTagName("Algorithm").item(0).getTextContent().trim();
+        String mode = suite.getElementsByTagName("Mode").item(0).getTextContent().trim();
+        String padding = suite.getElementsByTagName("Padding").item(0).getTextContent().trim();
+        if (algorithm.isEmpty() || mode.isEmpty() || padding.isEmpty())
+            throw new IOException("Algorithm, Mode, and Padding must be set in " + configPath);
+
+        ALGORITHM = algorithm;
+        MODE = mode;
+        PADDING = padding;
+
     }
 
     static void handle(Socket browser, String originHost, int originPort) {
@@ -215,8 +246,6 @@ public class ProxySocketServer {
         }
     }
 
-    // ------------------------------------------------------------------ handshake
-
     /** Raised when the server answers with a type-255 alert. */
     static class ServerAlert extends IOException {
         ServerAlert(String reason) { super(reason); }
@@ -228,32 +257,39 @@ public class ProxySocketServer {
      *
      *   1  proxy  -> server : SEQX || PCC
      *   2  server -> proxy  : SEQX+1 || SRV || CCC
-     *   3  proxy  -> server : SEQX+2 || SHA-256(SRV) || MEDIA
+     *   3  proxy  -> server : SEQX+2 || SHA-256(SRV) || MEDIA_NAME
      */
     static void handshake(InputStream in, OutputStream out, String media) throws IOException {
-        // Message 1: our proposal
-        long seqX = RANDOM.nextLong();
+        // M1: Proxy sends PCC 
+        long seqX = RANDOM.nextLong(); // Sequence number starts at a random value to prevent replay attacks.
         ByteArrayOutputStream b1 = new ByteArrayOutputStream();
         DataOutputStream p1 = new DataOutputStream(b1);
         p1.writeLong(seqX);
-        p1.writeUTF(PROPOSED_SUITE);
+        p1.writeUTF(ALGORITHM + "/" + MODE + "/" + PADDING);
         writeMessage(out, TYPE_HELLO, b1.toByteArray());
-        log(">> 1  SEQX=" + seqX + "  PCC=" + PROPOSED_SUITE);
 
-        // Message 2: server accepts and sends a challenge (or an alert)
+        log(">> 1  SEQX=" + seqX + "  PCC=" + ALGORITHM + "/" + MODE + "/" + PADDING);
+
+        // M2: If Server shares the same cryptographic suite, it accepts and sends challenge  and CCC; otherwise it sends an alert.
         Message m2 = readMessage(in);
         if (m2.type() == TYPE_ALERT) throw new ServerAlert(payloadReader(m2).readUTF());
-        if (m2.type() != TYPE_ACCEPT) throw new ProtocolException("expected type 2, got type " + m2.type());
+        if (m2.type() != TYPE_ACCEPT) throw new ProtocolException("Epected Type 2, got Type " + m2.type());
+
         DataInputStream p2 = payloadReader(m2);
         long seqY = p2.readLong();
         byte[] srv = new byte[SRV_BYTES];
         p2.readFully(srv);
         String ccc = p2.readUTF();
-        log("<< 2  SEQY=" + seqY + "  SRV=" + hex(srv).substring(0, 16) + "...  CCC=" + ccc);
-        if (seqY != seqX + 1) throw new ProtocolException("wrong sequence number " + seqY + ", expected " + (seqX + 1));
-        if (!ccc.equals(PROPOSED_SUITE)) throw new ProtocolException("server confirmed a different suite: " + ccc);
 
-        // Message 3: answer the challenge and name the movie
+        log("<< 2  SEQY=" + seqY + "  SRV=" + hex(srv).substring(0, 16) + "...  CCC=" + ccc);
+
+        if (seqY != seqX + 1) throw new ProtocolException("Wrong Sequence Number " + seqY + ", expected " + (seqX + 1));
+
+        if (!ccc.equals(ALGORITHM + "/" + MODE + "/" + PADDING)) {
+            throw new ProtocolException("Server doesn't support the requested cryptographic suite: " + ccc);
+        }
+
+        // M3: Proxy responds to the challenge with SHA-256(SRV) and the requested media name.
         long seqZ = seqY + 1;
         byte[] r = sha256(srv);
         ByteArrayOutputStream b3 = new ByteArrayOutputStream();
@@ -262,12 +298,12 @@ public class ProxySocketServer {
         p3.write(r);
         p3.writeUTF(media);
         writeMessage(out, TYPE_REQUEST, b3.toByteArray());
+
         log(">> 3  SEQZ=" + seqZ + "  R=" + hex(r).substring(0, 16) + "...  MEDIA=" + media);
     }
 
-    /** Header (always plaintext): version(2) | release(2) | type(1) | payload size(4), then the payload. */
+    /** Build the whole message first so it leaves in one write (not one TCP segment per field). Plaintext */
     static void writeMessage(OutputStream out, int type, byte[] payload) throws IOException {
-        // Build the whole message first so it leaves in one write (not one TCP segment per field).
         ByteArrayOutputStream msg = new ByteArrayOutputStream(9 + payload.length);
         DataOutputStream d = new DataOutputStream(msg);
         d.writeShort(HS_VERSION);
@@ -291,6 +327,7 @@ public class ProxySocketServer {
         if (size < 0 || size > MAX_PAYLOAD) throw new ProtocolException("invalid payload size " + size);
         byte[] payload = new byte[size];
         d.readFully(payload);
+
         return new Message(type, payload);
     }
 
@@ -316,6 +353,7 @@ public class ProxySocketServer {
         }
     }
 
+    /** Used only for logging */
     static String hex(byte[] b) {
         return java.util.HexFormat.of().formatHex(b);
     }
@@ -324,11 +362,10 @@ public class ProxySocketServer {
         System.out.println("[proxy] " + s);
     }
 
-    // ------------------------------------------------------------------ HTTP
-
     static void writeSimpleStatus(OutputStream out, int code, String reason) throws IOException {
         String resp = "HTTP/1.1 " + code + " " + reason + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         out.write(resp.getBytes(StandardCharsets.US_ASCII));
         out.flush();
     }
+
 }

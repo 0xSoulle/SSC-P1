@@ -1,25 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ProxyCryptoConfig version="1.0">
     <SymCipherSuite>
-        <Algorithm>ALG</Algorithm> // Ex: AES, ChaCha20, RC6, etc 
-        <Mode>MODE</Mode> // Ex: GCM, CCB,CTR, Poly1305 or NULL 
+        <Algorithm>AES</Algorithm> <!-- Ex: AES, ChaCha20, RC6, etc -->
+        <Mode>GCM</Mode> <!-- Ex: GCM, CCB, CTR, Poly1305 or NULL -->
         <InitializationVector>
-            <IV>IV Value</IV> // Ex: hexadecimal or base 64 rep. or NULL 
-            <IVSIZE>IV Size</IVSIZE> //Number of bits of IV or NULL     
+            <IV>IV Value</IV> <!-- Ex: hexadecimal or base 64 rep. or NULL -->
+            <IVSIZE>IV Size</IVSIZE> <!-- Number of bits of IV or NULL -->
         </InitializationVector>
-        <Padding>Paddingscheme</Padding>  // Ex: PKCS5Padding or NULL
+        <Padding>NoPadding</Padding> <!-- Ex: PKCS5Padding or NULL -->
     </SymCipherSuite>
     <MACSuite>
-        <Algorithm>ALG</Algorithm> //Ex: HMAC-SHA256, HMAC-SHA384, HMAC-SHA-512 or NULL
+        <Algorithm>ALG</Algorithm> <!-- Ex: HMAC-SHA256, HMAC-SHA384, HMAC-SHA-512 or NULL -->
     </MACSuite>
     <ConfiguredKeys>
         <SymmetricKey>
-            <SKey>key</SKey> // Key material in hexadecimal or base64 
-            <Keysize>SIZE</Keysize> // 128,192 or 256 bits 
+            <SKey>key</SKey> <!-- Key material in hexadecimal or base64 -->
+            <Keysize>SIZE</Keysize> <!-- 128, 192 or 256 bits -->
         </SymmetricKey>
         <MACKey>
-            <MacKey>key-mac</MacKey> // Mac Ley Value in hexadecimal or Base64 or NULL
-            <MacKeySize>Size</MacKeySize> // Number of bits of the Mac Key, or NULL
+            <MacKey>key-mac</MacKey> <!-- MAC key in hexadecimal or Base64 or NULL -->
+            <MacKeySize>Size</MacKeySize> <!-- Number of bits of the MAC key, or NULL -->
         </MACKey>
     </ConfiguredKeys>
 </ProxyCryptoConfig>
